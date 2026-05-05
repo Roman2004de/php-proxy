@@ -1,7 +1,7 @@
 ﻿<?php
 // run.php
 // PHP reverse proxy через ?url=
-// Пример: /run.php?url=https%3A%2F%2Fd-element.ru
+// Пример: /run.php?url=https%3A%2F%2Fsite.ru
 
 ini_set('display_errors', '0');
 ini_set('display_startup_errors', '0');
