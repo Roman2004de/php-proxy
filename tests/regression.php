@@ -2,10 +2,7 @@
 
 declare(strict_types=1);
 
-require dirname(__DIR__) . '/lib/urls.php';
-require dirname(__DIR__) . '/lib/rewrite.php';
-require dirname(__DIR__) . '/lib/security.php';
-require dirname(__DIR__) . '/lib/http.php';
+require dirname(__DIR__) . '/proxy.php';
 
 function same(mixed $expected, mixed $actual): void
 {
