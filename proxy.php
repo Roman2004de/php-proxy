@@ -32,7 +32,12 @@ function run_proxy(): void
         proxy_error(403, 'Cross-origin write is forbidden');
     }
 
-    $target = $_GET['url'] ?? '';
+    $pathInfo = $_SERVER['PATH_INFO'] ?? '';
+    if ($pathInfo !== '') {
+        $target = form_target($pathInfo, $method === 'GET' ? ($_SERVER['QUERY_STRING'] ?? '') : null);
+    } else {
+        $target = $_GET['url'] ?? '';
+    }
     if (!is_string($target) || strlen($target) > 8192 || ($parts = http_url_parts($target)) === null) {
         proxy_error(400, 'Usage: /proxy.php?url=https://example.com/');
     }
@@ -49,9 +54,12 @@ function run_proxy(): void
     }
 
     $cookieFile = $crossOrigin || $method === 'OPTIONS' ? null : session_cookie_file($directory, $secret, $origin);
-    [$status, $headers, $body, $bytes] = fetch_upstream($target, $parts, $method, $routes, $cookieFile);
-    send_upstream_response($status, $headers, $body, $bytes, $target, $method, $routes, $endpoint, $crossOrigin);
-    fclose($body);
+    $response = fetch_upstream($target, $parts, $method, $routes, $cookieFile, $crossOrigin);
+    if ($response !== null) {
+        [$status, $headers, $body, $bytes] = $response;
+        send_upstream_response($status, $headers, $body, $bytes, $target, $method, $routes, $endpoint, $crossOrigin);
+        fclose($body);
+    }
 }
 
 // Configuration, public access and session state.
@@ -112,7 +120,12 @@ function current_endpoint(array $routes): string
     if ($https !== 'on' && $https !== '1') {
         proxy_error(400, 'HTTPS is required');
     }
-    $endpoint = 'https://' . strtolower($_SERVER['HTTP_HOST'] ?? '') . ($_SERVER['SCRIPT_NAME'] ?? '');
+    $script = $_SERVER['SCRIPT_NAME'] ?? '';
+    $pathInfo = $_SERVER['PATH_INFO'] ?? '';
+    if ($pathInfo !== '' && str_ends_with($script, $pathInfo)) {
+        $script = substr($script, 0, -strlen($pathInfo));
+    }
+    $endpoint = 'https://' . strtolower($_SERVER['HTTP_HOST'] ?? '') . $script;
     if (!in_array($endpoint, $routes, true)) {
         proxy_error(421, 'Unknown proxy endpoint');
     }
@@ -331,6 +344,152 @@ function session_cookie_file(string $directory, string $secret, string $origin):
     return $directory . '/jar-' . hash('sha256', $origin . "\n" . $sid);
 }
 
+function cookie_records(array $lines): array
+{
+    $records = [];
+    $now = time();
+    foreach ($lines as $line) {
+        $fields = explode("\t", rtrim($line, "\r\n"), 7);
+        if (count($fields) !== 7 || ($fields[4] !== '0' && (int) $fields[4] <= $now)) {
+            continue;
+        }
+        $domain = str_starts_with($fields[0], '#HttpOnly_') ? substr($fields[0], 10) : $fields[0];
+        if ($domain === '' || $domain[0] === '#') {
+            continue;
+        }
+        $id = strtolower(ltrim($domain, '.')) . "\t" . $fields[2] . "\t" . $fields[5];
+        $records[$id] = implode("\t", $fields);
+    }
+    return $records;
+}
+
+function scan_cookie_storage(string $directory, int $now): array
+{
+    $total = 0;
+    $count = 0;
+    foreach (new DirectoryIterator($directory) as $file) {
+        if (!preg_match('~\Ajar-[0-9a-f]{64}(\.tmp)?\z~', $file->getFilename(), $match) || !$file->isFile()) {
+            continue;
+        }
+        $path = $file->getPathname();
+        if (isset($match[1])) {
+            unlink($path);
+            continue;
+        }
+        if ($file->getMTime() <= $now - 30 * 86400 && unlink($path)) {
+            continue;
+        }
+        $total += $file->getSize();
+        ++$count;
+    }
+    return [$now + 60, $total, $count];
+}
+
+function write_cookie_usage($lock, array $usage): void
+{
+    $record = implode(' ', $usage) . "\n";
+    if (!rewind($lock) || fwrite($lock, $record) !== strlen($record) ||
+        !ftruncate($lock, strlen($record)) || !fflush($lock)) {
+        config_error('Cannot save cookie storage statistics');
+    }
+}
+
+function with_cookie_storage(string $path, callable $operation): mixed
+{
+    $directory = dirname($path);
+    $lock = fopen($directory . '/jars.lock', 'c+b');
+    if ($lock === false) {
+        config_error('Cannot open cookie storage lock');
+    }
+    try {
+        $deadline = hrtime(true) + 250_000_000;
+        while (!flock($lock, LOCK_EX | LOCK_NB)) {
+            if (hrtime(true) >= $deadline) {
+                header('Retry-After: 1');
+                proxy_error(503, 'Cookie storage busy');
+            }
+            usleep(2000);
+        }
+        $now = time();
+        $state = stream_get_contents($lock, 128);
+        if (preg_match('~\A([0-9]+) ([0-9]+) ([0-9]+)\n\z~', (string) $state, $match) && (int) $match[1] > $now) {
+            $usage = [(int) $match[1], (int) $match[2], (int) $match[3]];
+        } else {
+            $usage = scan_cookie_storage($directory, $now);
+            write_cookie_usage($lock, $usage);
+        }
+        clearstatcache(true, $path);
+        $size = is_file($path) ? filesize($path) : false;
+        $contents = $size !== false && $size <= 65536 ? file_get_contents($path, false, null, 0, 65537) : false;
+        $records = $contents === false ? [] : cookie_records(explode("\n", $contents));
+        return $operation($records, $size, $usage, $lock);
+    } finally {
+        fclose($lock);
+    }
+}
+
+function load_cookie_snapshot(string $path): array
+{
+    return with_cookie_storage($path, static fn(array $records): array => $records);
+}
+
+function save_cookie_changes(string $path, array $before, array $after): void
+{
+    $added = array_diff_assoc($after, $before);
+    $removed = array_diff_key($before, $after);
+    if ($added === [] && $removed === []) {
+        return;
+    }
+    $quota = configured_limit('PHP_PROXY_MAX_COOKIE_STORAGE_BYTES', 16 * 1024 * 1024, 256 * 1024 * 1024);
+    with_cookie_storage($path, static function (array $latest, int|false $oldSize, array $usage, $lock) use (
+        $added, $removed, $path, $quota
+    ): void {
+        foreach ($removed as $id => $record) {
+            // Keep a cookie refreshed by a different response while this request was in flight.
+            if (($latest[$id] ?? null) === $record) {
+                unset($latest[$id]);
+            }
+        }
+        $merged = array_replace($latest, $added);
+        if ($merged === [] && $oldSize !== false) {
+            if (unlink($path)) {
+                $usage[1] = max(0, $usage[1] - $oldSize);
+                $usage[2] = max(0, $usage[2] - 1);
+                write_cookie_usage($lock, $usage);
+            }
+            return;
+        }
+        if ($merged === [] || $merged === $latest && $removed === []) {
+            return;
+        }
+        $data = implode("\n", $merged) . "\n";
+        $size = strlen($data);
+        $growth = $size - (int) $oldSize;
+        if ($size > 65536 || ($growth > 0 && $usage[1] + $growth > $quota) || ($oldSize === false && $usage[2] >= 4096)) {
+            return;
+        }
+
+        // Reserve additional space first. After an interrupted write, the next scan corrects the overcount.
+        $temp = $path . '.tmp';
+        if ($growth > 0 || $oldSize === false) {
+            $usage[1] += max(0, $growth);
+            $usage[2] += (int) ($oldSize === false);
+            write_cookie_usage($lock, $usage);
+        }
+        if (file_put_contents($temp, $data) !== $size || !rename($temp, $path)) {
+            if (is_file($temp)) {
+                unlink($temp);
+            }
+            error_log('PHP proxy: cannot update upstream cookie jar');
+            return;
+        }
+        if ($growth < 0) {
+            $usage[1] = max(0, $usage[1] + $growth);
+            write_cookie_usage($lock, $usage);
+        }
+    });
+}
+
 // URL resolution and proxy routing.
 
 function url_origin(array $parts): string
@@ -428,43 +587,72 @@ function is_blocked_url(string $url): bool
         str_contains($host, 'metrika') || preg_match('~metrika|watch\.js|tag\.js|webvisor~', $path) === 1;
 }
 
+function form_target(string $pathInfo, ?string $query): ?string
+{
+    if (!preg_match('~\A/_form/([a-zA-Z0-9_-]{1,10923})\z~', $pathInfo, $match)) {
+        return null;
+    }
+    $target = base64_decode(strtr($match[1], '-_', '+/'), true);
+    if ($target === false || strlen($target) > 8192 || str_contains($target, '#') || http_url_parts($target) === null) {
+        return null;
+    }
+    if ($query !== null) {
+        return explode('?', $target, 2)[0] . ($query === '' ? '' : '?' . $query);
+    }
+    return $target;
+}
+
 function proxied_target(string $url, array $routes): ?string
 {
     $parts = http_url_parts($url);
-    if ($parts === null || !isset($parts['query']) || !str_starts_with($parts['query'], 'url=')) {
+    if ($parts === null) {
         return null;
     }
-    $encoded = substr($parts['query'], 4);
-    $target = rawurldecode($encoded);
-    if (str_contains($encoded, '&') || preg_match('~\Ahttps?%3a%2f%2f~i', $encoded) !== 1) {
-        return null;
+    $path = $parts['path'] ?? '/';
+    $form = strrpos($path, '/proxy.php/_form/');
+    if ($form !== false) {
+        $form += strlen('/proxy.php');
+        $target = form_target(substr($path, $form), null);
+        if ($target === null) {
+            return null;
+        }
+        $path = substr($path, 0, $form);
+    } else {
+        $query = $parts['query'] ?? '';
+        if (str_contains($query, '&') || preg_match('~\Aurl=https?%3a%2f%2f~i', $query) !== 1) {
+            return null;
+        }
+        $target = rawurldecode(substr($query, 4));
     }
     $targetParts = http_url_parts($target);
     $endpoint = $targetParts === null ? null : ($routes[url_origin($targetParts)] ?? null);
-    if ($endpoint !== url_origin($parts) . ($parts['path'] ?? '/')) {
+    if ($endpoint !== url_origin($parts) . $path) {
         return null;
     }
     return $target . (isset($parts['fragment']) ? '#' . $parts['fragment'] : '');
 }
 
-function proxy_url(string $url, string $base, array $routes, string $endpoint): string
+function proxy_url(string $url, string $base, array $routes, string $endpoint, bool $form = false): string
 {
     $url = trim($url);
-    if ($url === '' || $url[0] === '#' || preg_match('~\A(?!https?:)[a-z][a-z0-9+.-]*:~i', $url)) {
+    if ((!$form && ($url === '' || $url[0] === '#')) || preg_match('~\A(?!https?:)[a-z][a-z0-9+.-]*:~i', $url)) {
         return $url;
     }
-    if (proxied_target($url, $routes) !== null) {
+    $alreadyProxied = proxied_target($url, $routes);
+    if ($alreadyProxied !== null && (!$form || str_contains(parse_url($url, PHP_URL_PATH) ?? '', '/proxy.php/_form/'))) {
         return $url;
     }
 
-    $absolute = absolute_url($url, $base);
+    $absolute = $alreadyProxied ?? absolute_url($url, $base);
     if (is_blocked_url($absolute)) {
         return 'data:text/javascript,';
     }
     $parts = http_url_parts($absolute);
     $route = $parts === null ? $endpoint : ($routes[url_origin($parts)] ?? $endpoint);
     $pieces = explode('#', $absolute, 2);
-    return $route . '?url=' . rawurlencode($pieces[0]) . (isset($pieces[1]) ? '#' . $pieces[1] : '');
+    $location = $form ? '/_form/' . rtrim(strtr(base64_encode($pieces[0]), '+/', '-_'), '=')
+        : '?url=' . rawurlencode($pieces[0]);
+    return $route . $location . (isset($pieces[1]) ? '#' . $pieces[1] : '');
 }
 
 // HTML, CSS and JavaScript rewriting.
@@ -523,8 +711,13 @@ function rewrite_js_urls(string $text, callable $rewrite): ?string
     $pattern = <<<'REGEX'
 ~ /\* [\s\S]*? \*/ (*SKIP)(*F) | //[^\r\n]* (*SKIP)(*F)
   | (?<prefix>
-        \b(?:import|export)\s+(?:[^;\n'"]*?\s+from\s*)?
-      | \bimport\s*\(\s*
+        (?<![.\w$]) import\b (?&gap)
+        (?:(?:(?:[\w$\x80-\xff]+ (?&gap) , (?&gap))?
+        (?:\{[^{}]*\}|\* (?&gap) as\b (?&gap) [\w$\x80-\xff]+)
+        |[\w$\x80-\xff]+) (?&gap) from\b (?&gap))?
+      | (?<![.\w$]) export\b (?&gap) (?:\{[^{}]*\}|\*(?:(?&gap)as\b(?&gap)[\w$\x80-\xff]+)?)
+        (?&gap) from\b (?&gap)
+      | (?<![.\w$]) import\b (?&gap) \( (?&gap)
       | \bnew\s+URL\s*\(\s*
   )
   (?<quote>["']) (?<specifier>[^"'\\\r\n]+) \k<quote>
@@ -532,6 +725,7 @@ function rewrite_js_urls(string $text, callable $rewrite): ?string
   | "(?:\\[\s\S]|[^"\\]++)*" (*SKIP)(*F)
   | '(?:\\[\s\S]|[^'\\]++)*' (*SKIP)(*F)
   | `(?:\\[\s\S]|[^`\\]++)*` (*SKIP)(*F)
+  (?(DEFINE)(?<gap>(?:\s++|/\*[\s\S]*?\*/|//[^\r\n]*)*+))
 ~x
 REGEX;
     return preg_replace_callback($pattern, function (array $match) use ($rewrite): string {
@@ -551,36 +745,108 @@ REGEX;
     }, $text);
 }
 
-function rewrite_markup_tag(string $tag, callable $rewrite): ?string
+function markup_attribute_pattern(): string
 {
-    $pattern = <<<'REGEX'
+    return <<<'REGEX'
 ~ (^</?[a-z][\w:-]*)
   | (\s+)([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^>\s]+)))?
 ~ix
 REGEX;
-    return preg_replace_callback($pattern, function (array $match) use ($rewrite): string {
-        if (!isset($match[3]) || (!isset($match[4]) && !isset($match[5]) && !isset($match[6]))) {
+}
+
+function markup_attribute(string $tag, string $name): ?string
+{
+    preg_match_all(markup_attribute_pattern(), $tag, $attributes, PREG_SET_ORDER | PREG_UNMATCHED_AS_NULL);
+    foreach ($attributes as $match) {
+        if (strtolower($match[3] ?? '') === $name) {
+            return html_entity_decode($match[4] ?? $match[5] ?? $match[6] ?? '', ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        }
+    }
+    return null;
+}
+
+function rewrite_markup_tag(string $tag, callable $rewrite, ?callable $form = null, bool $defaultAction = false): ?string
+{
+    $hasAction = false;
+    $result = preg_replace_callback(markup_attribute_pattern(), function (array $match) use ($rewrite, $form, &$hasAction): string {
+        if (!isset($match[3])) {
             return $match[0];
         }
-        $value = html_entity_decode($match[4] ?? $match[5] ?? $match[6], ENT_QUOTES | ENT_HTML5, 'UTF-8');
-        $result = match (strtolower($match[3])) {
-            'href', 'src', 'action', 'formaction', 'poster', 'data-src', 'data-href', 'xlink:href' => $rewrite($value),
-            'srcset', 'imagesrcset' => rewrite_srcset($value, $rewrite),
-            'style' => rewrite_css_urls($value, $rewrite),
-            default => $value,
-        };
+        $name = strtolower($match[3]);
+        $value = $match[4] ?? $match[5] ?? $match[6] ?? null;
+        if ($form !== null && ($name === 'action' || $name === 'formaction')) {
+            $hasAction = $hasAction || $name === 'action';
+            $result = $form(html_entity_decode($value ?? '', ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+        } else {
+            if ($value === null) {
+                return $match[0];
+            }
+            $value = html_entity_decode($value, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            $result = match ($name) {
+                'href', 'src', 'action', 'formaction', 'poster', 'data-src', 'data-href', 'xlink:href' => $rewrite($value),
+                'srcset', 'imagesrcset' => rewrite_srcset($value, $rewrite),
+                'style' => rewrite_css_urls($value, $rewrite),
+                default => $value,
+            };
+        }
         if ($result === $value || $result === null) {
             return $match[0];
         }
         return $match[2] . $match[3] . '="' . htmlspecialchars($result, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"';
     }, $tag, -1, $count, PREG_UNMATCHED_AS_NULL);
+    if ($result !== null && $defaultAction && !$hasAction && $form !== null) {
+        $action = ' action="' . htmlspecialchars($form(''), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"';
+        $end = str_ends_with($result, '/>') ? -2 : -1;
+        $result = substr_replace($result, $action, $end, 0);
+    }
+    return $result;
+}
+
+function html_base_url(string $html, string $pattern, string $document): ?string
+{
+    $offset = 0;
+    $templates = 0;
+    while (($matched = preg_match($pattern, $html, $match, PREG_OFFSET_CAPTURE, $offset)) === 1) {
+        $offset = $match[0][1] + strlen($match[0][0]);
+        $name = strtolower($match['name'][0] ?? '');
+        if (($match['template_end'][0] ?? '') !== '') {
+            $templates = max(0, $templates - 1);
+        } elseif ($name === 'template') {
+            ++$templates;
+        } elseif ($name === 'base' && $templates === 0) {
+            $href = markup_attribute($match['tag'][0], 'href');
+            if ($href !== null) {
+                $base = absolute_url($href, $document);
+                return http_url_parts($base) === null ? $document : $base;
+            }
+        }
+    }
+    return $matched === false ? null : $document;
 }
 
 function rewrite_text_urls(string $text, string $base, string $kind, array $routes, string $endpoint): ?string
 {
+    // Consume raw text elements as a unit so their contents are not parsed as HTML attributes.
+    $pattern = <<<'REGEX'
+~ <!--.*?--> | <!\[CDATA\[.*?\]\]> | <!doctype[^>]*>
+  | (?<head_end></head\s*>) | (?<template_end></template\s*>)
+  | (?<raw><(?<raw_name>script|style|textarea|title)(?=[\s/>])(?:[^>"']++|"[^"]*"|'[^']*')*+>)
+    (?<content>.*?) (?<close></\k<raw_name>\s*>|\z)
+  | (?<tag><(?<name>[a-z][\w:-]*)(?=[\s/>])(?:[^>"']++|"[^"]*"|'[^']*')*+>)
+~isx
+REGEX;
+    $document = $base;
+    if ($kind === 'html') {
+        $base = html_base_url($text, $pattern, $document);
+        if ($base === null) {
+            return null;
+        }
+    }
     $remaining = 8 * 1024 * 1024 - strlen($text);
-    $rewrite = static function (string $url) use ($base, $routes, $endpoint, &$remaining): string {
-        $result = proxy_url($url, $base, $routes, $endpoint);
+    $rewrite = static function (string $url, bool $form = false, bool $documentBase = false)
+        use ($base, $document, $routes, $endpoint, &$remaining): string {
+        $resolvedBase = $documentBase || ($form && trim($url) === '') ? $document : $base;
+        $result = proxy_url($url, $resolvedBase, $routes, $endpoint, $form);
         $remaining -= max(0, strlen($result) - strlen($url));
         if ($remaining < 0) {
             throw new LengthException('Rewritten text exceeds the output limit');
@@ -596,21 +862,12 @@ function rewrite_text_urls(string $text, string $base, string $kind, array $rout
         '~<meta\b[^>]*\bhttp-equiv\s*=\s*["\']?content-security-policy(?=[\s>"\'])~i', $text
     );
     $failed = false;
-    // Consume raw text elements as a unit so their contents are not parsed as HTML attributes.
-    $pattern = <<<'REGEX'
-~ <!--.*?--> | <!\[CDATA\[.*?\]\]> | <!doctype[^>]*>
-  | (?<head_end></head\s*>)
-  | (?<raw><(?<raw_name>script|style|textarea|title)(?=[\s/>])(?:[^>"']++|"[^"]*"|'[^']*')*+>)
-    (?<content>.*?) (?<close></\k<raw_name>\s*>|\z)
-  | (?<tag><(?<name>[a-z][\w:-]*)(?=[\s/>])(?:[^>"']++|"[^"]*"|'[^']*')*+>)
-~isx
-REGEX;
     $result = preg_replace_callback($pattern, function (array $match) use (
-        $base, $kind, $routes, $endpoint, $rewrite, $hasMetaCsp, &$injected, &$failed
+        $base, $document, $kind, $routes, $endpoint, $rewrite, $hasMetaCsp, &$injected, &$failed
     ): string {
         if (($match['head_end'] ?? '') !== '' && $hasMetaCsp && !$injected) {
             $injected = true;
-            return injected_js($base, $routes, $endpoint) . $match[0];
+            return injected_js($base, $routes, $endpoint, $document) . $match[0];
         }
         $tag = ($match['raw'] ?? '') ?: ($match['tag'] ?? '');
         if ($tag === '') {
@@ -618,7 +875,9 @@ REGEX;
         }
 
         $name = strtolower(($match['raw_name'] ?? '') ?: $match['name']);
-        $opening = rewrite_markup_tag($tag, $rewrite);
+        $tagRewrite = $name === 'base' ? fn(string $url): string => $rewrite($url, false, true) : $rewrite;
+        $formRewrite = $kind === 'html' ? fn(string $url): string => $rewrite($url, true) : null;
+        $opening = rewrite_markup_tag($tag, $tagRewrite, $formRewrite, $name === 'form');
         $content = $match['content'] ?? '';
         if ($name === 'style') {
             $content = rewrite_css_urls($content, $rewrite);
@@ -631,7 +890,7 @@ REGEX;
         }
         if ($kind === 'html' && $name === 'head' && !$hasMetaCsp && !$injected) {
             $injected = true;
-            $opening .= injected_js($base, $routes, $endpoint);
+            $opening .= injected_js($base, $routes, $endpoint, $document);
         }
         return $opening . $content . ($match['close'] ?? '');
     }, $text);
@@ -640,14 +899,14 @@ REGEX;
         return null;
     }
     if ($kind === 'html' && !$hasMetaCsp && !$injected) {
-        $runtime = injected_js($base, $routes, $endpoint);
+        $runtime = injected_js($base, $routes, $endpoint, $document);
         $result = preg_replace_callback('~\A(?:\xef\xbb\xbf)?\s*(?:<!doctype[^>]*>)?~i', fn(array $match): string =>
             $match[0] . $runtime, $result, 1);
     }
     return $result;
 }
 
-function injected_js(string $base, array $routes, string $endpoint): string
+function injected_js(string $base, array $routes, string $endpoint, ?string $document = null): string
 {
     $flags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_INVALID_UTF8_SUBSTITUTE;
     return strtr(<<<'HTML'
@@ -656,6 +915,7 @@ function injected_js(string $base, array $routes, string $endpoint): string
     const ROUTES = __PROXY_ROUTES__;
     const ENDPOINT = __PROXY_ENDPOINT__;
     const BASE = __PROXY_BASE__;
+    const DOCUMENT_URL = __PROXY_DOCUMENT__;
 
     function isBlocked(url) {
         try {
@@ -679,28 +939,42 @@ function injected_js(string $base, array $routes, string $endpoint): string
         }
     }
 
-    function isAlreadyProxied(url) {
+    function proxyTarget(url) {
         try {
             const candidate = new URL(url, location.href);
-            if (!/^\?url=https?%3a%2f%2f/i.test(candidate.search) || candidate.search.includes("&")) {
-                return false;
+            const formIndex = candidate.pathname.lastIndexOf("/proxy.php/_form/");
+            const index = formIndex === -1 ? -1 : formIndex + "/proxy.php".length;
+            let upstream;
+            let endpoint;
+            if (index !== -1) {
+                const encoded = candidate.pathname.slice(index + 7);
+                upstream = new URL(atob(encoded.replace(/-/g, "+").replace(/_/g, "/")));
+                endpoint = candidate.origin + candidate.pathname.slice(0, index);
+            } else if (/^\?url=https?%3a%2f%2f/i.test(candidate.search) && !candidate.search.includes("&")) {
+                upstream = new URL(candidate.searchParams.get("url"));
+                endpoint = candidate.origin + candidate.pathname;
             }
-            const upstream = new URL(candidate.searchParams.get("url"));
-            return ROUTES[upstream.origin] === candidate.origin + candidate.pathname;
-        } catch (e) {
-            return false;
-        }
+            if (upstream && ROUTES[upstream.origin] === endpoint) {
+                upstream.hash = candidate.hash;
+                return { upstream, form: index !== -1 };
+            }
+        } catch (e) {}
+        return null;
     }
 
-    function proxify(url) {
-        if (!url || typeof url !== "string") return url;
+    function proxify(url, form = false) {
+        if (typeof url !== "string") return url;
         url = url.trim();
-        if (!url || /^(#|(?!https?:)[a-z][a-z0-9+.-]*:)/i.test(url) || isAlreadyProxied(url)) {
+        if ((!form && (!url || url.startsWith("#"))) || /^(?!https?:)[a-z][a-z0-9+.-]*:/i.test(url)) {
+            return url;
+        }
+        const existing = url ? proxyTarget(url) : null;
+        if (existing && (!form || existing.form)) {
             return url;
         }
         try {
-            let target = new URL(url, BASE);
-            if (target.origin === location.origin) {
+            let target = existing ? existing.upstream : new URL(url || DOCUMENT_URL, BASE);
+            if (!existing && target.origin === location.origin) {
                 target = new URL(target.pathname + target.search + target.hash, BASE);
             }
             if (isBlocked(target.href)) {
@@ -709,8 +983,9 @@ function injected_js(string $base, array $routes, string $endpoint): string
             const href = target.href;
             const fragment = href.indexOf("#");
             const upstream = fragment < 0 ? href : href.slice(0, fragment);
-            return (ROUTES[target.origin] || ENDPOINT) + "?url=" + encodeURIComponent(upstream) +
-                (fragment < 0 ? "" : href.slice(fragment));
+            const path = form ? "/_form/" + btoa(upstream).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+                : "?url=" + encodeURIComponent(upstream);
+            return (ROUTES[target.origin] || ENDPOINT) + path + (fragment < 0 ? "" : href.slice(fragment));
         } catch (e) {
             return url;
         }
@@ -741,6 +1016,27 @@ function injected_js(string $base, array $routes, string $endpoint): string
 
     window.__proxyUrl = proxify;
 
+    const NativeRequest = window.Request;
+    if (NativeRequest) {
+        window.Request = class extends NativeRequest {
+            constructor(resource, options) {
+                if (typeof resource === "string" || resource instanceof URL) {
+                    resource = proxify(String(resource));
+                }
+                super(resource, options);
+            }
+        };
+    }
+
+    const NativeEventSource = window.EventSource;
+    if (NativeEventSource) {
+        window.EventSource = class extends NativeEventSource {
+            constructor(url, options) {
+                super(proxify(String(url)), options);
+            }
+        };
+    }
+
     const oldFetch = window.fetch;
 
     if (oldFetch) {
@@ -749,10 +1045,10 @@ function injected_js(string $base, array $routes, string $endpoint): string
                 resource = proxify(resource);
             } else if (resource instanceof URL) {
                 resource = proxify(resource.href);
-            } else if (resource instanceof Request) {
+            } else if (resource instanceof NativeRequest) {
                 const url = proxify(resource.url);
                 if (url !== resource.url) {
-                    resource = new Request(url, resource);
+                    resource = new NativeRequest(url, resource);
                 }
             }
 
@@ -778,7 +1074,9 @@ function injected_js(string $base, array $routes, string $endpoint): string
     const oldSetAttribute = Element.prototype.setAttribute;
 
     Element.prototype.setAttribute = function(name, value) {
-        if (/^(src|href|action|poster|data-src|data-href)$/i.test(name)) {
+        if (/^(action|formaction)$/i.test(name)) {
+            value = proxify(String(value), true);
+        } else if (/^(src|href|poster|data-src|data-href)$/i.test(name)) {
             value = proxify(String(value));
         } else if (/^srcset$/i.test(name)) {
             value = proxifySrcset(value);
@@ -787,7 +1085,7 @@ function injected_js(string $base, array $routes, string $endpoint): string
         return oldSetAttribute.call(this, name, value);
     };
 
-    function patchUrlProperty(proto, prop) {
+    function patchUrlProperty(proto, prop, form = false) {
         try {
             const desc = Object.getOwnPropertyDescriptor(proto, prop);
 
@@ -800,7 +1098,7 @@ function injected_js(string $base, array $routes, string $endpoint): string
                     return desc.get.call(this);
                 },
                 set: function(value) {
-                    return desc.set.call(this, proxify(value));
+                    return desc.set.call(this, proxify(String(value), form));
                 }
             });
         } catch (e) {}
@@ -811,7 +1109,26 @@ function injected_js(string $base, array $routes, string $endpoint): string
     if (window.HTMLIFrameElement) patchUrlProperty(HTMLIFrameElement.prototype, "src");
     if (window.HTMLLinkElement) patchUrlProperty(HTMLLinkElement.prototype, "href");
     if (window.HTMLAnchorElement) patchUrlProperty(HTMLAnchorElement.prototype, "href");
-    if (window.HTMLFormElement) patchUrlProperty(HTMLFormElement.prototype, "action");
+    if (window.HTMLFormElement) {
+        patchUrlProperty(HTMLFormElement.prototype, "action", true);
+        const submit = HTMLFormElement.prototype.submit;
+        HTMLFormElement.prototype.submit = function() {
+            oldSetAttribute.call(this, "action", proxify(this.getAttribute("action") || "", true));
+            return submit.call(this);
+        };
+        document.addEventListener("submit", function(event) {
+            const form = event.target;
+            if (form instanceof HTMLFormElement) {
+                oldSetAttribute.call(form, "action", proxify(form.getAttribute("action") || "", true));
+                const button = event.submitter;
+                if (button && button.hasAttribute("formaction")) {
+                    oldSetAttribute.call(button, "formaction", proxify(button.getAttribute("formaction"), true));
+                }
+            }
+        }, true);
+    }
+    if (window.HTMLButtonElement) patchUrlProperty(HTMLButtonElement.prototype, "formAction", true);
+    if (window.HTMLInputElement) patchUrlProperty(HTMLInputElement.prototype, "formAction", true);
     if (window.HTMLSourceElement) patchUrlProperty(HTMLSourceElement.prototype, "src");
 
     function proxifyNode(node) {
@@ -825,7 +1142,7 @@ function injected_js(string $base, array $routes, string $endpoint): string
             if (href) node.setAttribute("href", proxify(href));
 
             const action = node.getAttribute("action");
-            if (action) node.setAttribute("action", proxify(action));
+            if (action) node.setAttribute("action", action);
 
             const poster = node.getAttribute("poster");
             if (poster) node.setAttribute("poster", proxify(poster));
@@ -884,6 +1201,7 @@ HTML, [
         '__PROXY_ROUTES__' => json_encode($routes, $flags),
         '__PROXY_ENDPOINT__' => json_encode($endpoint, $flags),
         '__PROXY_BASE__' => json_encode($base, $flags),
+        '__PROXY_DOCUMENT__' => json_encode($document ?? $base, $flags),
     ]);
 }
 
@@ -895,7 +1213,7 @@ function upstream_request_headers(array $routes): array
         'accept', 'accept-language', 'content-type', 'range', 'if-range',
         'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since',
         'access-control-request-method', 'access-control-request-headers', 'x-requested-with',
-        'x-csrf-token', 'x-xsrf-token',
+        'x-csrf-token', 'x-xsrf-token', 'last-event-id',
     ];
     $headers = ['Accept-Encoding: identity'];
     foreach ($allowed as $name) {
@@ -916,7 +1234,23 @@ function upstream_request_headers(array $routes): array
     return $headers;
 }
 
-function fetch_upstream(string $target, array $parts, string $method, array $routes, ?string $cookieFile): array
+function start_event_stream(array $headers, array $routes, bool $crossOrigin): void
+{
+    http_response_code(200);
+    response_headers($headers, $routes, false, $crossOrigin, false);
+    header('Content-Type: ' . $headers['content-type'][0]);
+    header('X-Accel-Buffering: no');
+    while (ob_get_level() > 0) {
+        if (!ob_end_flush()) {
+            break;
+        }
+    }
+    flush();
+}
+
+function fetch_upstream(
+    string $target, array $parts, string $method, array $routes, ?string $cookieFile, bool $crossOrigin
+): ?array
 {
     $maximum = configured_limit('PHP_PROXY_MAX_RESPONSE_BYTES', 32 * 1024 * 1024, 256 * 1024 * 1024);
     $maximumInput = 2 * 1024 * 1024;
@@ -943,7 +1277,19 @@ function fetch_upstream(string $target, array $parts, string $method, array $rou
     $headerBytes = 0;
     $bytes = 0;
     $exceeded = false;
+    $streaming = false;
+    $started = hrtime(true);
+    $streamTimeout = configured_limit('PHP_PROXY_MAX_SSE_SECONDS', 300, 3600);
+    $cookiesBefore = [];
     $ch = curl_init($target);
+    $persistCookies = static function ($handle) use ($cookieFile, &$cookiesBefore): void {
+        if ($cookieFile !== null) {
+            $cookies = curl_getinfo($handle, CURLINFO_COOKIELIST);
+            if (is_array($cookies)) {
+                save_cookie_changes($cookieFile, $cookiesBefore, cookie_records($cookies));
+            }
+        }
+    };
     $options = [
         CURLOPT_CUSTOMREQUEST => $method,
         CURLOPT_NOBODY => $method === 'HEAD',
@@ -955,9 +1301,16 @@ function fetch_upstream(string $target, array $parts, string $method, array $rou
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_SSL_VERIFYHOST => 2,
         CURLOPT_USERAGENT => $_SERVER['HTTP_USER_AGENT'] ?? 'Mozilla/5.0',
-        CURLOPT_TIMEOUT => 40,
+        CURLOPT_TIMEOUT => max(40, $streamTimeout),
         CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_HEADERFUNCTION => static function ($handle, string $line) use (&$responseHeaders, &$headerBytes): int {
+        CURLOPT_NOPROGRESS => false,
+        CURLOPT_XFERINFOFUNCTION => static function () use (&$streaming, $started, $streamTimeout): int {
+            $limit = $streaming ? $streamTimeout : 40;
+            return (int) (hrtime(true) - $started >= $limit * 1_000_000_000 || connection_aborted());
+        },
+        CURLOPT_HEADERFUNCTION => static function ($handle, string $line) use (
+            &$responseHeaders, &$headerBytes, &$streaming, $method, $routes, $crossOrigin, $persistCookies
+        ): int {
             $length = strlen($line);
             $headerBytes += $length;
             if ($headerBytes > 64 * 1024) {
@@ -965,6 +1318,12 @@ function fetch_upstream(string $target, array $parts, string $method, array $rou
             }
             if (str_starts_with($line, 'HTTP/')) {
                 $responseHeaders = [];
+            } elseif (!$streaming && $method === 'GET' && trim($line) === '' &&
+                curl_getinfo($handle, CURLINFO_RESPONSE_CODE) === 200 &&
+                strtolower(trim(explode(';', $responseHeaders['content-type'][0] ?? '', 2)[0])) === 'text/event-stream') {
+                $persistCookies($handle);
+                $streaming = true;
+                start_event_stream($responseHeaders, $routes, $crossOrigin);
             } elseif (($colon = strpos($line, ':')) !== false) {
                 $name = strtolower(substr($line, 0, $colon));
                 $value = trim(substr($line, $colon + 1));
@@ -974,11 +1333,17 @@ function fetch_upstream(string $target, array $parts, string $method, array $rou
             }
             return $length;
         },
-        CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use ($body, $maximum, &$bytes, &$exceeded): int {
+        CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use ($body, $maximum, &$bytes, &$exceeded, &$streaming): int {
             $length = strlen($chunk);
             if ($length > $maximum - $bytes) {
                 $exceeded = true;
                 return 0;
+            }
+            if ($streaming) {
+                $bytes += $length;
+                echo $chunk;
+                flush();
+                return connection_aborted() ? 0 : $length;
             }
             $written = fwrite($body, $chunk);
             $bytes += (int) $written;
@@ -989,17 +1354,8 @@ function fetch_upstream(string $target, array $parts, string $method, array $rou
         $options[CURLOPT_POSTFIELDS] = $input;
     }
 
-    // A bounded set of locks protects jars without creating a file for every visitor.
-    $lock = null;
-    $hasCookieFile = false;
     if ($cookieFile !== null) {
-        $lockFile = dirname($cookieFile) . '/cookie-lock-' . substr(basename($cookieFile), 4, 3);
-        $lock = fopen($lockFile, 'c+');
-        if ($lock === false || !flock($lock, LOCK_EX)) {
-            config_error('Cannot lock the upstream cookie jar');
-        }
-        $hasCookieFile = is_file($cookieFile);
-        $options[CURLOPT_COOKIEFILE] = $hasCookieFile ? $cookieFile : '';
+        $options[CURLOPT_COOKIEFILE] = '';
     }
     // CURLOPT_PROTOCOLS_STR supersedes CURLOPT_PROTOCOLS on newer PHP/libcurl.
     if (defined('CURLOPT_PROTOCOLS_STR')) {
@@ -1009,23 +1365,23 @@ function fetch_upstream(string $target, array $parts, string $method, array $rou
     if (!curl_setopt_array($ch, $options)) {
         config_error('Cannot configure cURL');
     }
+    if ($cookieFile !== null) {
+        foreach (load_cookie_snapshot($cookieFile) as $cookie) {
+            if (!curl_setopt($ch, CURLOPT_COOKIELIST, $cookie)) {
+                config_error('Cannot load upstream cookies');
+            }
+        }
+        $cookiesBefore = cookie_records(curl_getinfo($ch, CURLINFO_COOKIELIST) ?: []);
+    }
     $result = curl_exec($ch);
     $curlError = curl_errno($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    if ($result !== false && $cookieFile !== null) {
-        $cookies = curl_getinfo($ch, CURLINFO_COOKIELIST);
-        if ($cookies) {
-            if (!curl_setopt($ch, CURLOPT_COOKIEJAR, $cookieFile)) {
-                config_error('Cannot save the upstream cookie jar');
-            }
-        } elseif ($hasCookieFile && is_array($cookies) && !unlink($cookieFile)) {
-            config_error('Cannot remove an empty upstream cookie jar');
-        }
+    if ($streaming) {
+        fclose($body);
+        return null;
     }
-    // Destroy the handle (and flush its cookie jar) while the lock is held.
-    unset($ch);
-    if (is_resource($lock)) {
-        fclose($lock);
+    if ($result !== false) {
+        $persistCookies($ch);
     }
     if ($result === false || $status < 200 || $status > 599) {
         fclose($body);

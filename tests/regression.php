@@ -54,6 +54,36 @@ same('import x from ' . $jsUrl('module.mjs') . '; import(' . $jsUrl('dynamic.mjs
     rewrite_js_urls("import x from './module.mjs'; import('./dynamic.mjs');", $rewrite));
 same('// import("./ignored.js")' . "\n" . "import 'package.js';", rewrite_js_urls('// import("./ignored.js")' . "\n" . "import 'package.js';", $rewrite));
 
+$compact = [
+    'import{value}from"./module.mjs";' => 'import{value}from' . $jsUrl('module.mjs') . ';',
+    'import"./module.mjs";' => 'import' . $jsUrl('module.mjs') . ';',
+    'export*from"./module.mjs";' => 'export*from' . $jsUrl('module.mjs') . ';',
+    "import/* comment */{value}\nfrom './module.mjs';" => "import/* comment */{value}\nfrom " . $jsUrl('module.mjs') . ';',
+];
+foreach ($compact as $source => $expected) {
+    same($expected, rewrite_js_urls($source, $rewrite));
+}
+
+$formUrl = proxy_url('/search?old=1#results', $base, $routes, $endpoint, true);
+$formPath = substr(parse_url($formUrl, PHP_URL_PATH), strlen('/proxy.php'));
+same('results', parse_url($formUrl, PHP_URL_FRAGMENT));
+same('https://site.example/search?old=1', form_target($formPath, null));
+same('https://site.example/search?q=one&q=two&url=field', form_target($formPath, 'q=one&q=two&url=field'));
+same('https://site.example/search', form_target($formPath, ''));
+same(null, form_target('/_form/bad/extra', ''));
+same($formUrl, proxy_url($formUrl, $base, $routes, $endpoint, true));
+same('https://site.example/search?old=1#results', proxied_target($formUrl, $routes));
+
+$withBase = rewrite_text_urls(
+    '<html><head><!-- <base href="/ignored/"> --><template><base href="/ignored/"></template><base href="../assets/"></head>'
+    . '<body><img src="photo.png"><form><button formaction="find">Search</button></form></body></html>',
+    $base, 'html', $routes, $endpoint
+);
+same(true, str_contains($withBase, rawurlencode('https://site.example/assets/photo.png')));
+same(true, str_contains($withBase, '<base href="' . $encode('https://site.example/assets/') . '">'));
+same(true, str_contains($withBase, '<form action="' . proxy_url($base, $base, $routes, $endpoint, true) . '">'));
+same(true, str_contains($withBase, 'formaction="' . proxy_url('https://site.example/assets/find', $base, $routes, $endpoint, true) . '"'));
+
 $data = 'data:image/png;base64,iVBORw0KGgo=';
 $srcset = $data . ' 1x, photo.png 2x';
 same($data . ' 1x, ' . $encode('https://site.example/dir/photo.png') . ' 2x', rewrite_srcset($srcset, $rewrite));
@@ -81,4 +111,37 @@ same(client_network('2001:db8:1234:5678::1'), client_network('2001:db8:1234:5678
 same(false, client_network('2001:db8:1234:5678::1') === client_network('2001:db8:1234:5679::1'));
 same(true, is_public_ip('8.8.8.8'));
 same(true, is_public_ip('2606:4700::1111'));
+$cookieDirectory = sys_get_temp_dir() . '/proxy-test-' . bin2hex(random_bytes(8));
+mkdir($cookieDirectory, 0700);
+$oldCookieQuota = getenv('PHP_PROXY_MAX_COOKIE_STORAGE_BYTES');
+try {
+    putenv('PHP_PROXY_MAX_COOKIE_STORAGE_BYTES=16384');
+    $jar = $cookieDirectory . '/jar-' . str_repeat('a', 64);
+    $expired = $cookieDirectory . '/jar-' . str_repeat('b', 64);
+    file_put_contents($expired, 'old');
+    touch($expired, time() - 31 * 86400);
+    same([], load_cookie_snapshot($jar));
+    same(false, is_file($expired));
+    $one = cookie_records(["#HttpOnly_site.example\tFALSE\t/\tTRUE\t0\tfirst\tone"]);
+    $two = cookie_records(["site.example\tFALSE\t/\tTRUE\t0\tsecond\ttwo"]);
+    save_cookie_changes($jar, [], $one);
+    save_cookie_changes($jar, [], $two);
+    same($one + $two, load_cookie_snapshot($jar));
+    save_cookie_changes($jar, $one, []);
+    same($two, load_cookie_snapshot($jar));
+
+    putenv('PHP_PROXY_MAX_COOKIE_STORAGE_BYTES=1');
+    save_cookie_changes($jar, $two, $two + $one);
+    same($two, load_cookie_snapshot($jar));
+    $newJar = $cookieDirectory . '/jar-' . str_repeat('c', 64);
+    save_cookie_changes($newJar, [], $one);
+    same(false, is_file($newJar));
+} finally {
+    putenv($oldCookieQuota === false ? 'PHP_PROXY_MAX_COOKIE_STORAGE_BYTES'
+        : 'PHP_PROXY_MAX_COOKIE_STORAGE_BYTES=' . $oldCookieQuota);
+    foreach (glob($cookieDirectory . '/*') as $file) {
+        unlink($file);
+    }
+    rmdir($cookieDirectory);
+}
 echo "Regression checks passed.\n";
