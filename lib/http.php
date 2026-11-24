@@ -102,15 +102,17 @@ function fetch_upstream(string $target, array $parts, string $method, array $rou
         $options[CURLOPT_POSTFIELDS] = $input;
     }
 
-    // Serialize read/write updates to a cookie jar shared by concurrent requests.
+    // A bounded set of locks protects jars without creating a file for every visitor.
     $lock = null;
+    $hasCookieFile = false;
     if ($cookieFile !== null) {
-        $lock = fopen($cookieFile . '.lock', 'c+');
+        $lockFile = dirname($cookieFile) . '/cookie-lock-' . substr(basename($cookieFile), 4, 3);
+        $lock = fopen($lockFile, 'c+');
         if ($lock === false || !flock($lock, LOCK_EX)) {
             config_error('Cannot lock the upstream cookie jar');
         }
-        $options[CURLOPT_COOKIEFILE] = $cookieFile;
-        $options[CURLOPT_COOKIEJAR] = $cookieFile;
+        $hasCookieFile = is_file($cookieFile);
+        $options[CURLOPT_COOKIEFILE] = $hasCookieFile ? $cookieFile : '';
     }
     // CURLOPT_PROTOCOLS_STR supersedes CURLOPT_PROTOCOLS on newer PHP/libcurl.
     if (defined('CURLOPT_PROTOCOLS_STR')) {
@@ -123,6 +125,16 @@ function fetch_upstream(string $target, array $parts, string $method, array $rou
     $result = curl_exec($ch);
     $curlError = curl_errno($ch);
     $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    if ($result !== false && $cookieFile !== null) {
+        $cookies = curl_getinfo($ch, CURLINFO_COOKIELIST);
+        if ($cookies) {
+            if (!curl_setopt($ch, CURLOPT_COOKIEJAR, $cookieFile)) {
+                config_error('Cannot save the upstream cookie jar');
+            }
+        } elseif ($hasCookieFile && is_array($cookies) && !unlink($cookieFile)) {
+            config_error('Cannot remove an empty upstream cookie jar');
+        }
+    }
     // Destroy the handle (and flush its cookie jar) while the lock is held.
     unset($ch);
     if (is_resource($lock)) {

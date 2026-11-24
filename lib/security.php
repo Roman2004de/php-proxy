@@ -36,7 +36,7 @@ function configured_routes(): array
         $proxy = is_string($endpoint) ? http_url_parts($endpoint) : null;
         if ($upstream === null || !is_dns_hostname($upstream['host']) || url_origin($upstream) !== $origin ||
             $proxy === null || !is_dns_hostname($proxy['host']) || $proxy['scheme'] !== 'https' ||
-            !preg_match('~\A/(?:[a-zA-Z0-9_-]+/)*run\.php\z~', $proxy['path'] ?? '') ||
+            !preg_match('~\A/(?:[a-zA-Z0-9_-]+/)*proxy\.php\z~', $proxy['path'] ?? '') ||
             $endpoint !== url_origin($proxy) . $proxy['path'] || isset($usedHosts[$proxy['host']])) {
             config_error('Invalid or shared endpoint in PHP_PROXY_ORIGINS');
         }
@@ -79,17 +79,24 @@ function private_directory(): string
     return $directory;
 }
 
-function authenticate(): array
+function state_secret(string $directory): string
 {
-    $users = config_map('PHP_PROXY_USERS');
-    $user = $_SERVER['PHP_AUTH_USER'] ?? '';
-    $password = $_SERVER['PHP_AUTH_PW'] ?? '';
-    $hash = $users[$user] ?? null;
-    if ($user === '' || !is_string($hash) || !password_verify($password, $hash)) {
-        header('WWW-Authenticate: Basic realm="PHP Proxy", charset="UTF-8"');
-        proxy_error(401, 'Authentication required');
+    $file = fopen($directory . '/session.key', 'c+b');
+    if ($file === false || !flock($file, LOCK_EX)) {
+        config_error('Cannot lock the state key');
     }
-    return [$user, $hash];
+    $key = stream_get_contents($file, 33);
+    if ($key === '') {
+        $key = random_bytes(32);
+        if (fwrite($file, $key) !== 32 || !fflush($file)) {
+            config_error('Cannot save the state key');
+        }
+    }
+    fclose($file);
+    if ($key === false || strlen($key) !== 32) {
+        config_error('Invalid state key');
+    }
+    return $key;
 }
 
 function configured_limit(string $name, int $default, int $maximum): int
@@ -105,24 +112,64 @@ function configured_limit(string $name, int $default, int $maximum): int
     return $value;
 }
 
-function limit_requests(string $directory, string $user): void
+function client_network(string $address): string
 {
-    $limit = configured_limit('PHP_PROXY_REQUESTS_PER_MINUTE', 240, 100000);
-    $file = fopen($directory . '/rate-' . hash('sha256', $user), 'c+');
+    $packed = filter_var($address, FILTER_VALIDATE_IP) !== false ? inet_pton($address) : false;
+    if ($packed === false) {
+        return '';
+    }
+    if (strlen($packed) === 4) {
+        return $packed;
+    }
+    if (str_starts_with($packed, str_repeat("\0", 10) . "\xff\xff")) {
+        return substr($packed, 12);
+    }
+    // Group temporary IPv6 addresses in the same /64.
+    return substr($packed, 0, 8);
+}
+
+function rate_count($file, int $offset, int $window): int
+{
+    if (fseek($file, $offset) !== 0 || ($record = fread($file, 8)) === false) {
+        config_error('Cannot read rate counters');
+    }
+    if (strlen($record) !== 8) {
+        return 0;
+    }
+    $saved = unpack('Nwindow/Ncount', $record);
+    return $saved['window'] === $window ? $saved['count'] : 0;
+}
+
+function write_rate_count($file, int $offset, int $window, int $count): void
+{
+    if (fseek($file, $offset) !== 0 || fwrite($file, pack('NN', $window, $count)) !== 8) {
+        config_error('Cannot update rate counters');
+    }
+}
+
+function limit_requests(string $directory, string $secret, string $address): void
+{
+    $perClient = configured_limit('PHP_PROXY_REQUESTS_PER_MINUTE', 240, 100000);
+    $global = configured_limit('PHP_PROXY_GLOBAL_REQUESTS_PER_MINUTE', 2400, 100000);
+    // Record zero is the global counter. Fixed-size buckets cap disk usage regardless of client count.
+    $bucket = hexdec(substr(hash_hmac('sha256', client_network($address), $secret), 0, 4));
+    $clientOffset = ($bucket + 1) * 8;
+    $file = fopen($directory . '/rates.bin', 'c+b');
     if ($file === false || !flock($file, LOCK_EX)) {
-        config_error('Cannot lock rate counter');
+        config_error('Cannot lock rate counters');
     }
     $window = intdiv(time(), 60);
-    $saved = explode(' ', (string) stream_get_contents($file, 64), 2);
-    $count = ($saved[0] ?? '') === (string) $window ? (int) ($saved[1] ?? 0) : 0;
-    if ($count >= $limit) {
+    $total = rate_count($file, 0, $window);
+    $count = rate_count($file, $clientOffset, $window);
+    if ($total >= $global || $count >= $perClient) {
         fclose($file);
-        header('Retry-After: ' . ($window * 60 + 60 - time()));
+        header('Retry-After: ' . max(1, ($window + 1) * 60 - time()));
         proxy_error(429, 'Request limit exceeded');
     }
-    $record = $window . ' ' . ($count + 1);
-    if (!rewind($file) || !ftruncate($file, 0) || fwrite($file, $record) !== strlen($record) || !fflush($file)) {
-        config_error('Cannot update rate counter');
+    write_rate_count($file, 0, $window, $total + 1);
+    write_rate_count($file, $clientOffset, $window, $count + 1);
+    if (!fflush($file)) {
+        config_error('Cannot save rate counters');
     }
     fclose($file);
 }
@@ -207,10 +254,10 @@ function is_cross_origin(string $endpoint): bool
     return $referer !== null && url_origin($referer) !== $expected;
 }
 
-function session_cookie_file(string $directory, string $user, string $hash, string $origin): string
+function session_cookie_file(string $directory, string $secret, string $origin): string
 {
     $name = '__Host-PHP_PROXY_SESSION';
-    $key = static fn(string $data): string => hash_hmac('sha256', $origin . "\n" . $user . "\n" . $data, $hash);
+    $key = static fn(string $data): string => hash_hmac('sha256', $origin . "\n" . $data, $secret);
     $cookie = $_COOKIE[$name] ?? null;
     if (is_string($cookie) && preg_match('~\A([a-f0-9]{64})\.([0-9]{1,12})\.([a-f0-9]{64})\z~', $cookie, $match) &&
         (int) $match[2] > time() && hash_equals($key($match[1] . '.' . $match[2]), $match[3])) {
@@ -227,5 +274,5 @@ function session_cookie_file(string $directory, string $user, string $hash, stri
             'samesite' => 'Strict',
         ]);
     }
-    return $directory . '/jar-' . hash('sha256', $user . "\n" . $origin . "\n" . $sid);
+    return $directory . '/jar-' . hash('sha256', $origin . "\n" . $sid);
 }

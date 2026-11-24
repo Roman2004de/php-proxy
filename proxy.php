@@ -20,10 +20,10 @@ header('Strict-Transport-Security: max-age=31536000');
 
 $routes = configured_routes();
 $endpoint = current_endpoint($routes);
-[$user, $passwordHash] = authenticate();
 $directory = private_directory();
 umask(0077);
-limit_requests($directory, $user);
+$secret = state_secret($directory);
+limit_requests($directory, $secret, $_SERVER['REMOTE_ADDR'] ?? '');
 
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 if (!in_array($method, ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], true)) {
@@ -37,7 +37,7 @@ if ($crossOrigin && !in_array($method, ['GET', 'HEAD', 'OPTIONS'], true)) {
 
 $target = $_GET['url'] ?? '';
 if (!is_string($target) || strlen($target) > 8192 || ($parts = http_url_parts($target)) === null) {
-    proxy_error(400, 'Usage: /run.php?url=https://example.com/');
+    proxy_error(400, 'Usage: /proxy.php?url=https://example.com/');
 }
 $origin = url_origin($parts);
 if (($routes[$origin] ?? null) !== $endpoint) {
@@ -51,7 +51,7 @@ if (is_blocked_url($target)) {
     exit;
 }
 
-$cookieFile = $crossOrigin ? null : session_cookie_file($directory, $user, $passwordHash, $origin);
+$cookieFile = $crossOrigin || $method === 'OPTIONS' ? null : session_cookie_file($directory, $secret, $origin);
 [$status, $headers, $body, $bytes] = fetch_upstream($target, $parts, $method, $routes, $cookieFile);
 send_upstream_response($status, $headers, $body, $bytes, $target, $method, $routes, $endpoint, $crossOrigin);
 fclose($body);

@@ -15,13 +15,13 @@ function same(mixed $expected, mixed $actual): void
 }
 
 $base = 'https://site.example/dir/current.html?old=1';
-$endpoint = 'https://site.proxy.example/run.php';
-$assetsEndpoint = 'https://assets.proxy.example/run.php';
+$endpoint = 'https://site.proxy.example/proxy.php';
+$assetsEndpoint = 'https://assets.proxy.example/proxy.php';
 $routes = ['https://site.example' => $endpoint, 'https://assets.example' => $assetsEndpoint];
 $encode = fn(string $target): string => $endpoint . '?url=' . rawurlencode($target);
 $rewrite = fn(string $url): string => proxy_url($url, $base, $routes, $endpoint);
 
-same('<?php', file_get_contents(dirname(__DIR__) . '/run.php', false, null, 0, 5));
+same('<?php', file_get_contents(dirname(__DIR__) . '/proxy.php', false, null, 0, 5));
 foreach ([
     '?v=2' => 'https://site.example/dir/current.html?v=2',
     '?' => 'https://site.example/dir/current.html?',
@@ -36,7 +36,7 @@ foreach ([
     same($absolute, absolute_url($relative, $base));
 }
 
-$nested = 'https://site.example/run.php?url=https%3A%2F%2Fassets.example';
+$nested = 'https://site.example/proxy.php?url=https%3A%2F%2Fassets.example';
 same($encode($nested), $rewrite($nested));
 same($encode($nested), $rewrite($encode($nested)));
 same($assetsEndpoint . '?url=' . rawurlencode('https://assets.example/font.woff') . '#x', $rewrite('//assets.example/font.woff#x'));
@@ -79,6 +79,9 @@ foreach (['127.0.0.1', '10.0.0.1', '100.64.0.1', '169.254.169.254', '192.0.2.1',
     '224.0.0.1', '::1', '::ffff:8.8.8.8', 'fc00::1', 'fe80::1', '2001:db8::1', '2002::1', '3fff::1'] as $blocked) {
     same(false, is_public_ip($blocked));
 }
+same(client_network('192.0.2.10'), client_network('::ffff:192.0.2.10'));
+same(client_network('2001:db8:1234:5678::1'), client_network('2001:db8:1234:5678::ab'));
+same(false, client_network('2001:db8:1234:5678::1') === client_network('2001:db8:1234:5679::1'));
 same(true, is_public_ip('8.8.8.8'));
 same(true, is_public_ip('2606:4700::1111'));
 echo "Regression checks passed.\n";
