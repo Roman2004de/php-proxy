@@ -35,3 +35,7 @@
 ```sh
 php tests/regression.php
 ```
+
+## Лицензия
+
+This script is released under the MIT License.
